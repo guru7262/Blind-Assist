@@ -24,6 +24,9 @@
       "permissions": [
         "CAMERA",
         "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "CAMERA",
+        "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO"
       ],
       "adaptiveIcon": {
@@ -37,6 +40,17 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "3ae95951-5970-4a34-9e77-16a7a01425d0"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/3ae95951-5970-4a34-9e77-16a7a01425d0"
     }
   }
 }

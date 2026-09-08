@@ -1,38 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
+import * as Speech from 'expo-speech';
 
-const CAPTURE_INTERVAL_MS = 3500;
+const CAPTURE_INTERVAL_MS = 5000;
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '';
-const RIME_API_KEY = process.env.EXPO_PUBLIC_RIME_API_KEY ?? '';
-
-type SpeechCategory = 'NORMAL' | 'IMPORTANT' | 'URGENT';
 
 function normalizeSceneText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
-}
-
-function buildDemoScene(previousScene: string | null): string {
-  const previous = previousScene ? normalizeSceneText(previousScene).toLowerCase() : '';
-
-  if (!previous) {
-    return 'There is a desk ahead with a laptop on it.';
-  }
-
-  if (previous.includes('desk')) {
-    return 'A chair is directly ahead and may block the path.';
-  }
-
-  if (previous.includes('chair')) {
-    return 'The path ahead is clear.';
-  }
-
-  if (previous.includes('path')) {
-    return 'A person has entered the room from your left.';
-  }
-
-  return 'There is a doorway ahead and a clear path through it.';
 }
 
 function isNoUpdateResponse(value: string): boolean {
@@ -40,43 +15,32 @@ function isNoUpdateResponse(value: string): boolean {
 }
 
 function buildGeminiPrompt(previousScene: string | null): string {
-  return `You are a visual assistant for a visually impaired person.
+  return `Analyze this camera frame for a visually impaired person. Describe obstacles, people, doors, paths, and important objects. Be concise (max 20 words). If nothing changed, reply: NO_UPDATE
 
-Analyze the current camera frame and describe only information that is useful for understanding the person's immediate surroundings.
-
-Prioritize:
-1. Potential obstacles or hazards
-2. People and their movement
-3. Doors, entrances and exits
-4. Walkable paths
-5. Important objects
-6. Meaningful changes in the environment
-
-Do not describe decorative or irrelevant details.
-Keep the response concise and natural because it will be spoken aloud.
-Maximum 25 words.
-
-If nothing meaningful has changed compared with the previous scene, return exactly:
-NO_UPDATE
-
-Previous scene: ${previousScene ?? 'None'}`;
+Previous: ${previousScene ?? 'None'}`;
 }
 
 async function analyzeSceneWithGemini(
   imageBase64: string,
   previousScene: string | null,
 ): Promise<string> {
+  console.log('=== GEMINI API CALL ===');
+
   if (!GEMINI_API_KEY) {
-    return buildDemoScene(previousScene);
+    console.error('ERROR: No API key in .env');
+    return 'ERROR: No API key';
   }
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
+  try {
+    const modelName = 'gemini-3.6-flash';
+    const url = `https://generativelanguage.googleapis.com/v1/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+
+    console.log('Model:', modelName);
+    console.log('Image size:', imageBase64.length, 'bytes');
+
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [
           {
@@ -93,52 +57,46 @@ async function analyzeSceneWithGemini(
           },
         ],
       }),
-    },
-  );
+    });
 
-  if (!response.ok) {
-    throw new Error(`Gemini request failed with status: ${response.status}`);
+    console.log('Response status:', response.status);
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error('Gemini error:', response.status, text.substring(0, 100));
+      return `ERROR: Status ${response.status}`;
+    }
+
+    const data = await response.json();
+    const result = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? 'NO_UPDATE';
+    console.log('Gemini result:', result);
+    return result;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error('Exception:', msg);
+    return `ERROR: ${msg}`;
   }
-
-  const data = await response.json();
-  const text =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((part: { text?: string }) => part.text ?? '')
-      .join('')
-      .trim() ?? '';
-
-  if (!text) {
-    return 'NO_UPDATE';
-  }
-
-  return text.replace(/```/g, '').trim();
 }
 
-async function getRimeAudioUrl(text: string): Promise<string | null> {
-  if (!RIME_API_KEY) {
-    return null;
+async function speakText(text: string): Promise<void> {
+  try {
+    console.log('Speaking:', text);
+    
+    // Stop any existing speech
+    await Speech.stop();
+    
+    // Use native TTS with max volume
+    await Speech.speak(text, {
+      language: 'en',
+      pitch: 1.0,
+      rate: 0.9,
+      volume: 1.0,  // Max volume (0.0 to 1.0)
+      onDone: () => console.log('Speech finished'),
+      onError: (error) => console.warn('Speech error:', error),
+    });
+  } catch (error) {
+    console.warn('TTS failed:', error);
   }
-
-  const response = await fetch('https://users.rime.ai/v1/rime-tts', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${RIME_API_KEY}`,
-    },
-    body: JSON.stringify({
-      text,
-      model: 'mist',
-      speaker: 'mist',
-      format: 'wav',
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Rime request failed with status: ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data?.audioUrl ?? data?.audio_url ?? data?.output?.audio_url ?? null;
 }
 
 export default function App() {
@@ -146,163 +104,118 @@ export default function App() {
   const [cameraReady, setCameraReady] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [previousScene, setPreviousScene] = useState<string | null>(null);
-  const [statusText, setStatusText] = useState('Preparing camera');
+  const [statusText, setStatusText] = useState('Initializing...');
   const cameraRef = useRef<CameraView | null>(null);
-  const soundRef = useRef<Audio.Sound | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const stopCurrentAudio = useCallback(async () => {
-    if (soundRef.current) {
-      await soundRef.current.stopAsync();
-      await soundRef.current.unloadAsync();
-      soundRef.current = null;
-    }
+  // Setup speech
+  useEffect(() => {
+    Speech.getAvailableVoicesAsync()
+      .then((voices) => console.log(`✓ ${voices.length} voices available`))
+      .catch((e) => console.warn('Speech init failed:', e));
   }, []);
 
-  const speakText = useCallback(
-    async (fullText: string) => {
-      const text = normalizeSceneText(fullText);
-      if (!text) {
-        return;
-      }
-
-      await stopCurrentAudio();
-
-      setStatusText(`Speaking: ${text}`);
-
-      if (!RIME_API_KEY) {
-        return;
-      }
-
-      try {
-        const audioUrl = await getRimeAudioUrl(text);
-
-        if (!audioUrl) {
-          return;
-        }
-
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: audioUrl },
-          { shouldPlay: true, isLooping: false },
-        );
-
-        soundRef.current = sound;
-        sound.setOnPlaybackStatusUpdate((playbackStatus) => {
-          if (playbackStatus.isLoaded && playbackStatus.didJustFinish) {
-            sound.unloadAsync();
-            soundRef.current = null;
-          }
-        });
-      } catch (error) {
-        console.warn('Unable to synthesize spoken output with Rime:', error);
-      }
-    },
-    [stopCurrentAudio],
-  );
-
+  // Request camera permission
   useEffect(() => {
-    Audio.setAudioModeAsync({
-      playsInSilentModeIOS: true,
-      staysActiveInBackground: false,
-      interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-      interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
-      shouldDuckAndroid: true,
-    });
-  }, []);
-
-  useEffect(() => {
-    if (!permission) {
-      return;
-    }
-
+    if (!permission) return;
     if (!permission.granted && permission.canAskAgain) {
+      console.log('Requesting camera permission');
       requestPermission();
     }
   }, [permission, requestPermission]);
 
   const captureAndAnalyze = useCallback(async () => {
-    if (!cameraRef.current || isProcessing) {
-      return;
-    }
+    if (!cameraRef.current || isProcessing) return;
 
     setIsProcessing(true);
-    setStatusText('Capturing frame');
+    console.log('📸 Capturing frame...');
 
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.35,
+        quality: 0.5,
         base64: true,
         skipProcessing: false,
       });
 
-      if (!photo?.base64) {
-        throw new Error('No base64 image returned by the camera');
-      }
+      if (!photo?.base64) throw new Error('No base64');
+      console.log(`✓ Frame captured: ${Math.round(photo.base64.length / 1024)}KB`);
 
-      const sceneDescription = await analyzeSceneWithGemini(photo.base64, previousScene);
-      const trimmedDescription = normalizeSceneText(sceneDescription);
+      setStatusText('Analyzing...');
 
-      if (!trimmedDescription || isNoUpdateResponse(trimmedDescription)) {
-        setStatusText('No meaningful update');
+      const result = await analyzeSceneWithGemini(photo.base64, previousScene);
+
+      if (result.includes('ERROR')) {
+        console.error('Analysis error:', result);
+        setStatusText('❌ ' + result);
         return;
       }
 
-      setPreviousScene(trimmedDescription);
-      await speakText(trimmedDescription);
-      setStatusText(`Scene updated: ${trimmedDescription}`);
+      const trimmed = normalizeSceneText(result);
+
+      if (!trimmed || isNoUpdateResponse(trimmed)) {
+        console.log('No update detected');
+        setStatusText('No change detected');
+        return;
+      }
+
+      console.log('✅ New scene:', trimmed);
+      setPreviousScene(trimmed);
+      setStatusText(trimmed);
+
+      // Speak the description
+      await speakText(trimmed);
     } catch (error) {
-      console.warn('Frame processing failed:', error);
-      setStatusText('Frame skipped due to an error');
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('Capture error:', msg);
+      setStatusText('❌ Error: ' + msg);
     } finally {
       setIsProcessing(false);
     }
-  }, [isProcessing, previousScene, speakText]);
+  }, [isProcessing, previousScene]);
 
+  // Capture loop
   useEffect(() => {
     if (!permission?.granted || !cameraReady) {
+      console.log('Waiting for permission and camera ready');
       return;
     }
 
+    console.log('▶️ Starting capture loop (5s interval)');
     let cancelled = false;
 
-    const scheduleNextCapture = () => {
-      if (cancelled) {
-        return;
-      }
-
+    const loop = () => {
+      if (cancelled) return;
       timeoutRef.current = setTimeout(async () => {
-        if (cancelled) {
-          return;
-        }
-
-        await captureAndAnalyze();
-
         if (!cancelled) {
-          scheduleNextCapture();
+          await captureAndAnalyze();
+          if (!cancelled) loop();
         }
       }, CAPTURE_INTERVAL_MS);
     };
 
-    scheduleNextCapture();
+    loop();
 
     return () => {
       cancelled = true;
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      console.log('Capture loop stopped');
     };
   }, [cameraReady, captureAndAnalyze, permission?.granted]);
 
   if (!permission) {
-    return <View style={styles.container} />;
+    return (
+      <View style={styles.container}>
+        <Text style={styles.message}>Loading permissions...</Text>
+      </View>
+    );
   }
 
   if (!permission.granted) {
     return (
       <View style={styles.container}>
-        <Text style={styles.message}>Camera permission is required.</Text>
-        <Text style={styles.action} onPress={() => requestPermission()}>
-          Allow camera access
+        <Text style={styles.message}>Camera permission required</Text>
+        <Text style={styles.button} onPress={() => requestPermission()}>
+          Grant access
         </Text>
       </View>
     );
@@ -314,7 +227,11 @@ export default function App() {
         ref={cameraRef}
         facing="back"
         style={styles.camera}
-        onCameraReady={() => setCameraReady(true)}
+        onCameraReady={() => {
+          console.log('📹 Camera ready');
+          setCameraReady(true);
+          setStatusText('Ready');
+        }}
       />
 
       <View pointerEvents="none" style={styles.overlay} />
@@ -330,8 +247,8 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000',
-    alignItems: 'center',
     justifyContent: 'center',
+    alignItems: 'center',
   },
   camera: {
     ...StyleSheet.absoluteFill,
@@ -343,27 +260,28 @@ const styles = StyleSheet.create({
   },
   statusBar: {
     position: 'absolute',
+    bottom: 28,
     left: 16,
     right: 16,
-    bottom: 28,
+    backgroundColor: 'rgba(15, 23, 42, 0.9)',
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 12,
-    backgroundColor: 'rgba(15, 23, 42, 0.72)',
   },
   statusText: {
     color: '#f8fafc',
-    fontSize: 14,
+    fontSize: 16,
     textAlign: 'center',
+    fontWeight: '600',
   },
   message: {
     color: '#fff',
-    fontSize: 20,
-    marginBottom: 16,
+    fontSize: 18,
+    marginBottom: 12,
   },
-  action: {
+  button: {
     color: '#7dd3fc',
-    fontSize: 16,
+    fontSize: 14,
     textDecorationLine: 'underline',
   },
 });
